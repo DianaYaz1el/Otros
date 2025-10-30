@@ -1,1 +1,15 @@
-#
+Python 3.12.4 | packaged by Anaconda, Inc. | (main, Jun 18 2024, 15:03:56) [MSC v.1929 64 bit (AMD64)]
+Type "copyright", "credits" or "license" for more information.
+
+IPython 8.25.0 -- An enhanced Interactive Python.
+
+Reiniciando el núcleo...
+ 
+
+runfile('C:/Users/diana/Pyton_microcontroladores/wifiobluetooth.py', wdir='C:/Users/diana/Pyton_microcontroladores')
+
+
+Task was destroyed but it is pending!
+task: <Task pending name='Task-4' coro=<Kernel.poll_control_queue() running at C:\ProgramData\anaconda3\Lib\site-packages\ipykernel\kernelbase.py:296> wait_for=<Future finished result=<Future at 0x...state=pending>> cb=[_chain_future.<locals>._call_set_state() at C:\ProgramData\anaconda3\Lib\asyncio\futures.py:394]>
+
+
