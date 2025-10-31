@@ -1,26 +1,34 @@
 # -*- coding: utf-8 -*-
 """
-Control de Motores + Simulador 3D (v2 estable) + HC-SR04 (solo detección)
-- Sin frenado automático: NO envía 'detener' al detectar objeto
-- Rate limit + coalescing + 3 reintentos antes de desconectar
-- Connection: close en cada petición (mejora estabilidad Pico W)
-- Mapeo configurable (incluye LR como Adelante/Atrás)
-- Opción: 'detener' al soltar (OFF por defecto)
-- Indicador de distancia + Alerta objeto (HTTP /distancia)
-Autor: diana (integrado)
+Control de Motores + Simulador 3D (Wi-Fi o Bluetooth) + HC-SR04 (solo detección)
+- Misma interfaz que la tuya; arriba eliges Wi-Fi o Bluetooth (HC-05/HC-06)
+- HTTP: /adelante /atras /girar_izquierda /girar_derecha /detener /velocidad?v= /distancia
+- BT:   envía líneas de texto con los mismos comandos; 'distancia' responde JSON {"cm":..}
+Autor: diana (integrado) + adaptación
 """
 
-import math, time, os, threading
+import sys, asyncio
+if sys.platform.startswith("win"):
+    # Evita el "Task was destroyed..." con Tkinter en Windows + Spyder/IPython
+    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+
+import math, time, os, threading, json
 import tkinter as tk
 from tkinter import filedialog, messagebox
 from PIL import Image, ImageTk, ImageDraw, ImageFilter
 import requests
 
+# ---- Bluetooth (pyserial) ----
+try:
+    import serial, serial.tools.list_ports
+except Exception:
+    serial = None
+
 # ----------------------------- Configuración general -----------------------------
-TIMEOUT = 1.5        # seg para peticiones HTTP
+TIMEOUT = 1.5        # seg para peticiones HTTP / lecturas BT
 RATE_LIMIT_MS = 200  # mínimo entre envíos
 MAX_FAILS = 3        # errores consecutivos antes de marcar desconectado
-ULTRA_POLL_MS = 200  # periodo de lectura de /distancia
+ULTRA_POLL_MS = 250  # periodo de lectura de distancia
 
 # Colores / estilo
 SCALE          = 1.0
@@ -41,9 +49,9 @@ GRID_N         = 7
 
 # Imagen inicial del carrito (puedes cambiarla)
 IMG_PATH = r"C:\Users\diana\Pyton_microcontroladores\ImagenesInterfaces\carrito.png"
-SPRITE_W = 160  # ancho en píxeles del sprite del carrito
+SPRITE_W = 160
 
-# Rutas de íconos (si no existen, se dibujan placeholders)
+# Íconos
 ruta_flecha_arriba    = r"C:\Users\diana\Pyton_microcontroladores\ImagenesInterfaces\up.png"
 ruta_flecha_abajo     = r"C:\Users\diana\Pyton_microcontroladores\ImagenesInterfaces\down.png"
 ruta_flecha_derecha   = r"C:\Users\diana\Pyton_microcontroladores\ImagenesInterfaces\right.png"
@@ -51,15 +59,103 @@ ruta_flecha_izquierda = r"C:\Users\diana\Pyton_microcontroladores\ImagenesInterf
 ruta_detener          = r"C:\Users\diana\Pyton_microcontroladores\ImagenesInterfaces\stop.png"
 
 # ----------------------------- Estado global -----------------------------
-estado = {"conectado": False}
+estado = {"conectado": False, "modo":"Wi-Fi"}
 MODO_NORMAL = "Normal"
 MODO_LR_FA  = "Left/Right = Adelante/Atrás"
 
-# ----------------------------- Comunicación HTTP robusta -----------------------------
+# ----------------------------- Transports (Wi-Fi / BT) -----------------------------
+class HttpTransport:
+    def __init__(self, get_ip):
+        self.get_ip = get_ip
+    def connect(self):
+        return self.is_alive()
+    def is_alive(self):
+        ip = self.get_ip().strip()
+        if not ip: return False
+        for path in ("/ping","/"):
+            try:
+                r = requests.get(f"http://{ip}{path}", timeout=TIMEOUT,
+                                 headers={"Connection":"close"}, allow_redirects=False)
+                if r.status_code < 500:
+                    return True
+            except requests.exceptions.RequestException:
+                pass
+        return False
+    def send(self, cmd):
+        ip = self.get_ip().strip()
+        if not ip: raise RuntimeError("IP vacía")
+        r = requests.get(f"http://{ip}/{cmd}", timeout=TIMEOUT,
+                         headers={"Connection":"close"}, allow_redirects=False)
+        return r.status_code == 200
+    def read_distance(self):
+        ip = self.get_ip().strip()
+        r = requests.get(f"http://{ip}/distancia", timeout=TIMEOUT,
+                         headers={"Connection":"close"})
+        try:
+            j = r.json(); d = j.get("cm", None)
+            return None if d is None else float(d)
+        except ValueError:
+            txt = r.text.strip()
+            if txt and txt.lower() != "null":
+                return float(txt)
+            return None
+
+class BtTransport:
+    def __init__(self, get_port, baud_getter=lambda:9600):
+        self.get_port = get_port
+        self.get_baud = baud_getter
+        self.ser = None
+    def connect(self):
+        if serial is None:
+            raise RuntimeError("pyserial no instalado. Ejecuta: pip install pyserial")
+        port = self.get_port().strip()
+        if not port: return False
+        self.close()
+        self.ser = serial.Serial(port, self.get_baud(), timeout=TIMEOUT)
+        # saludar y limpiar buffer
+        try:
+            self.ser.write(b"ping\n")
+        except Exception:
+            pass
+        return True
+    def is_alive(self):
+        return self.ser is not None and self.ser.is_open
+    def send(self, cmd):
+        if not self.is_alive(): return False
+        line = (cmd+"\n").encode("utf-8")
+        self.ser.write(line)
+        return True
+    def read_distance(self):
+        if not self.is_alive(): return None
+        self.ser.reset_input_buffer()
+        self.ser.write(b"distancia\n")
+        line = self.ser.readline().decode(errors="ignore").strip()
+        # acepta {"cm":xx} o número suelto
+        if not line:
+            return None
+        try:
+            j = json.loads(line)
+            d = j.get("cm", None)
+            return None if d is None else float(d)
+        except Exception:
+            try:
+                return float(line)
+            except Exception:
+                return None
+    def close(self):
+        if self.ser:
+            try: self.ser.close()
+            except: pass
+            self.ser = None
+
+# instancia actual (se setea al conectar)
+transport = None
+
+# ----------------------------- Comunicación robusta (rate-limit) -----------------------------
 class CommandSender:
-    """Rate-limit + coalescing + retries + 'Connection: close'."""
-    def __init__(self, get_ip_callable, on_soft_error, on_hard_disconnect):
-        self.get_ip = get_ip_callable
+    """Rate-limit + coalescing + retries."""
+    def __init__(self, sender_callable, on_soft_error, on_hard_disconnect):
+        self._send = sender_callable
         self.on_soft_error = on_soft_error
         self.on_hard_disconnect = on_hard_disconnect
         self.lock = threading.Lock()
@@ -79,111 +175,53 @@ class CommandSender:
                 return
             now = time.time() * 1000
             wait_ms = max(0, RATE_LIMIT_MS - int(now - self.last_ts))
-
         if wait_ms > 0:
-            root.after(wait_ms, self._pump)
-            return
+            root.after(wait_ms, self._pump); return
 
         def _send():
             with self.lock:
-                if self.pending is None:
-                    return
-                cmd_local = self.pending
-                self.pending = None
-                self.inflight = True
+                if self.pending is None: return
+                cmd_local = self.pending; self.pending=None; self.inflight=True
+            ok = False
             try:
-                ip = self.get_ip().strip()
-                if not ip:
-                    raise RuntimeError("IP vacía")
-                url = f"http://{ip}/{cmd_local}"
-                r = requests.get(url, timeout=TIMEOUT,
-                                 headers={"Connection":"close"},
-                                 allow_redirects=False)
-                if r.status_code == 200:
-                    with self.lock:
-                        self.fail_count = 0
-                        self.last_ts = time.time() * 1000
-                    print(f"[OK] {cmd_local}")
-                else:
-                    print(f"[HTTP {r.status_code}] {cmd_local}")
-                    self._register_fail()
+                ok = self._send(cmd_local)
             except Exception as e:
-                print(f"[ERR] {cmd_local}: {e}")
-                self._register_fail()
-            finally:
-                with self.lock:
-                    self.inflight = False
+                print("[ERR]", e)
+            with self.lock:
+                if ok:
+                    self.fail_count = 0
+                    self.last_ts = time.time() * 1000
+                else:
+                    self.fail_count += 1
+                    if self.fail_count < MAX_FAILS:
+                        self.on_soft_error(f"Intento fallido ({self.fail_count}/{MAX_FAILS}).")
+                    else:
+                        self.on_hard_disconnect("Múltiples fallos de envío.")
+                self.inflight=False
             root.after(0, self._pump)
-
         threading.Thread(target=_send, daemon=True).start()
-
-    def _register_fail(self):
-        with self.lock:
-            self.fail_count += 1
-            fc = self.fail_count
-        if fc < MAX_FAILS:
-            self.on_soft_error(f"Intento fallido ({fc}/{MAX_FAILS}).")
-        else:
-            self.on_hard_disconnect("Múltiples fallos de envío.")
-
-def set_controles(habilitar: bool):
-    st = ("normal" if habilitar else "disabled")
-    for b in botones_mov:
-        b.config(state=st)
-
-def on_conectado():
-    estado["conectado"] = True
-    lbl_estado.config(text=f"Estado: Conectado a {ent_ip.get().strip()}", fg="green")
-    btn_conectar.config(text="Reconectar", state="normal")
-    set_controles(True)
-    _start_ultra_poll()   # <-- solo leer distancia (sin frenar)
-
-def on_desconectado(msg="No se pudo contactar el dispositivo."):
-    estado["conectado"] = False
-    lbl_estado.config(text=f"Estado: Desconectado. {msg}", fg="red")
-    btn_conectar.config(text="Conectar", state="normal")
-    set_controles(False)
-    _stop_ultra_poll()
-
-def http_alive(ip, timeout=TIMEOUT):
-    for path in ("/ping", "/"):
-        try:
-            r = requests.get(f"http://{ip}{path}", timeout=timeout,
-                             headers={"Connection":"close"}, allow_redirects=False)
-            if r.status_code < 500:
-                return True
-        except requests.exceptions.RequestException:
-            pass
-    return False
-
-def verificar_conexion():
-    ip = ent_ip.get().strip()
-    if not ip:
-        messagebox.showwarning("IP faltante", "Ingresa la dirección IP del Pico W.")
-        return
-    lbl_estado.config(text="Estado: Verificando conexión...", fg="orange")
-    btn_conectar.config(state="disabled")
-    root.after(50, lambda: _hacer_verificacion(ip))
-
-def _hacer_verificacion(ip):
-    if http_alive(ip):
-        on_conectado()
-    else:
-        on_desconectado(f"No responde en {ip}. Verifica Wi‑Fi/energía/servidor HTTP.")
 
 def soft_warn(msg):
     if estado["conectado"]:
         lbl_estado.config(text=f"Estado: Conectado — {msg}", fg="orange")
 
-sender = CommandSender(
-    get_ip_callable=lambda: ent_ip.get(),
-    on_soft_error=soft_warn,
-    on_hard_disconnect=lambda m: on_desconectado(f"{m} (revisa señal/energía).")
-)
+def on_desconectado(msg="No se pudo contactar el dispositivo."):
+    global transport
+    estado["conectado"] = False
+    lbl_estado.config(text=f"Estado: Desconectado. {msg}", fg="red")
+    btn_conectar.config(text="Conectar", state="normal")
+    set_controles(False)
+    _stop_ultra_poll()
+    if isinstance(transport, BtTransport):
+        transport.close()
+    transport = None
 
-def enviar_comando(cmd):
-    if estado["conectado"]:
-        sender.queue(cmd)
+def on_conectado_ok():
+    estado["conectado"] = True
+    lbl_estado.config(text=f"Estado: Conectado ({estado['modo']})", fg="green")
+    btn_conectar.config(text="Reconectar", state="normal")
+    set_controles(True)
+    _start_ultra_poll()
 
 # ----------------------------- GUI helpers (imágenes y plano) -----------------------------
 def _ph_from_image_or_fallback(path, size, kind):
@@ -273,43 +311,62 @@ def sprite_from_angle(img, ang_deg):
 
 # ----------------------------- Ventana principal -----------------------------
 root = tk.Tk()
-root.title("Control de Motores + Simulador 3D (v2) + HC-SR04 (solo detección)")
+root.title("Control Wi-Fi / Bluetooth + Simulador 3D + HC-SR04")
 root.configure(bg=BG_APP)
-root.geometry(f"{int(1220*SCALE)}x{int(900*SCALE)}")
+root.geometry(f"{int(1220*SCALE)}x{int(920*SCALE)}")
 
 # Encabezado
 frm_top = tk.Frame(root, padx=10, pady=10, bg=BG_APP)
 frm_top.pack(fill="x")
 
-tk.Label(frm_top, text="IP del Pico W:", fg="white", bg=BG_APP).grid(row=0, column=0, sticky="w")
-ent_ip = tk.Entry(frm_top, width=18)
-ent_ip.grid(row=0, column=1, padx=(6,10))
+# Selector Wi-Fi / BT
+tk.Label(frm_top, text="Modo:", fg="white", bg=BG_APP)\
+  .grid(row=0, column=0, sticky="w")
+modo_conn = tk.StringVar(value="Wi-Fi")
+tk.OptionMenu(frm_top, modo_conn, "Wi-Fi", "Bluetooth").grid(row=0, column=1, sticky="w", padx=(6,10))
+
+# Wi-Fi
+tk.Label(frm_top, text="IP del Pico W:", fg="white", bg=BG_APP).grid(row=0, column=2, sticky="e")
+ent_ip = tk.Entry(frm_top, width=16); ent_ip.grid(row=0, column=3, padx=(6,12))
 ent_ip.insert(0, "192.168.0.101")
 
-btn_conectar = tk.Button(frm_top, text="Conectar", command=verificar_conexion)
-btn_conectar.grid(row=0, column=2, padx=(0,10))
+# Bluetooth
+tk.Label(frm_top, text="COM:", fg="white", bg=BG_APP).grid(row=0, column=4, sticky="e")
+ent_com = tk.Entry(frm_top, width=8); ent_com.grid(row=0, column=5, padx=(6,8))
+# autollenar puerto si existe pyserial
+if serial:
+    ports = [p.device for p in serial.tools.list_ports.comports()]
+    if ports:
+        ent_com.insert(0, ports[0])
+else:
+    ent_com.insert(0, "COMx")
+
+btn_conectar = tk.Button(frm_top, text="Conectar")
+btn_conectar.grid(row=0, column=6, padx=(8,10))
 
 lbl_estado = tk.Label(frm_top, text="Estado: Desconectado", fg="red", bg=BG_APP)
-lbl_estado.grid(row=1, column=0, columnspan=3, sticky="w", pady=(8,0))
+lbl_estado.grid(row=1, column=0, columnspan=7, sticky="w", pady=(8,0))
 
 # Opciones
 opciones = tk.Frame(frm_top, bg=BG_APP)
-opciones.grid(row=2, column=0, columnspan=3, sticky="w", pady=(6,0))
+opciones.grid(row=2, column=0, columnspan=7, sticky="w", pady=(6,0))
 tk.Label(opciones, text="Mapa de teclas:", fg="white", bg=BG_APP).grid(row=0, column=0, sticky="w")
 
+MODO_NORMAL = "Normal"; MODO_LR_FA = "Left/Right = Adelante/Atrás"
 modo_var = tk.StringVar(value=MODO_LR_FA)
-modo_menu = tk.OptionMenu(opciones, modo_var, MODO_NORMAL, MODO_LR_FA)
-modo_menu.grid(row=0, column=1, padx=(6,12))
+tk.OptionMenu(opciones, modo_var, MODO_NORMAL, MODO_LR_FA).grid(row=0, column=1, padx=(6,12))
 
 invertir_lr_var = tk.BooleanVar(value=False)
 tk.Checkbutton(opciones, text="Invertir LR (adelante↔atrás)", variable=invertir_lr_var,
-               fg="white", bg=BG_APP, selectcolor=BG_APP, activebackground=BG_APP).grid(row=0, column=2, padx=(6,12))
+               fg="white", bg=BG_APP, selectcolor=BG_APP, activebackground=BG_APP)\
+  .grid(row=0, column=2, padx=(6,12))
 
 detener_release_var = tk.BooleanVar(value=False)
 tk.Checkbutton(opciones, text="Enviar 'detener' al soltar", variable=detener_release_var,
-               fg="white", bg=BG_APP, selectcolor=BG_APP, activebackground=BG_APP).grid(row=0, column=3, padx=(6,12))
+               fg="white", bg=BG_APP, selectcolor=BG_APP, activebackground=BG_APP)\
+  .grid(row=0, column=3, padx=(6,12))
 
-tk.Label(opciones, text="(Rate‑limit 200ms • 3 reintentos)", fg="#cbd5e1", bg=BG_APP).grid(row=0, column=4)
+tk.Label(opciones, text="(Rate-limit 200ms • 3 reintentos)", fg="#cbd5e1", bg=BG_APP).grid(row=0, column=4)
 
 # Contenedor 2 columnas
 frm_mid = tk.Frame(root, bg=BG_APP)
@@ -346,6 +403,11 @@ btn_left.place(x=100, y=220)
 btn_stop.place(x=90, y=470)
 
 botones_mov = [btn_up, btn_down, btn_right, btn_left, btn_stop]
+
+def set_controles(habilitar: bool):
+    st = ("normal" if habilitar else "disabled")
+    for b in botones_mov: b.config(state=st)
+
 set_controles(False)
 
 # -------- Simulador 3D (derecha) --------
@@ -396,110 +458,83 @@ def elegir_imagen():
 btn_img.config(command=elegir_imagen)
 
 # ---------- Distancia + Alerta objeto (sin frenar) ----------
-ultra_ui = tk.Frame(frm_right, bg=BG_APP)
-ultra_ui.pack(pady=(0,6))
-
+ultra_ui = tk.Frame(frm_right, bg=BG_APP); ultra_ui.pack(pady=(0,6))
 tk.Label(ultra_ui, text="Distancia:", fg="white", bg=BG_APP).grid(row=0, column=0, sticky="w")
 dist_text = tk.StringVar(value="— cm")
 lbl_dist = tk.Label(ultra_ui, textvariable=dist_text, fg="#38bdf8", bg=BG_APP, font=("Segoe UI", 14, "bold"))
 lbl_dist.grid(row=0, column=1, padx=(6,14))
-
-alerta_var = tk.BooleanVar(value=True)  # habilitar alerta visual/beep
+alerta_var = tk.BooleanVar(value=True)
 tk.Checkbutton(ultra_ui, text="Alerta objeto <", variable=alerta_var,
                fg="white", bg=BG_APP, selectcolor=BG_APP, activebackground=BG_APP)\
   .grid(row=0, column=2)
-
-umbral_var = tk.IntVar(value=25)  # cm
-umbral_entry = tk.Entry(ultra_ui, width=4, textvariable=umbral_var)
-umbral_entry.grid(row=0, column=3)
+umbral_var = tk.IntVar(value=25)
+umbral_entry = tk.Entry(ultra_ui, width=4, textvariable=umbral_var); umbral_entry.grid(row=0, column=3)
 tk.Label(ultra_ui, text="cm", fg="white", bg=BG_APP).grid(row=0, column=4, padx=(2,8))
-
 beep_var = tk.BooleanVar(value=False)
 tk.Checkbutton(ultra_ui, text="Beep", variable=beep_var,
                fg="white", bg=BG_APP, selectcolor=BG_APP, activebackground=BG_APP)\
   .grid(row=0, column=5)
 
-# Estado grande LIBRE / OBJETO
-estado_ui = tk.Frame(frm_right, bg=BG_APP)
-estado_ui.pack(pady=(0,10))
+# Estado grande
+estado_ui = tk.Frame(frm_right, bg=BG_APP); estado_ui.pack(pady=(0,10))
 tk.Label(estado_ui, text="Estado:", fg="white", bg=BG_APP).grid(row=0, column=0, sticky="w")
 obj_text = tk.StringVar(value="Libre")
 lbl_objeto = tk.Label(estado_ui, textvariable=obj_text, fg="#22c55e", bg=BG_APP, font=("Segoe UI", 16, "bold"))
 lbl_objeto.grid(row=0, column=1, padx=(8,0), sticky="w")
 
 ultra_job = None
-objeto_presente = False  # para detectar cambios y hacer beep solo en flanco
+objeto_presente = False
 
 def _poll_ultrasonico():
     global ultra_job, objeto_presente
-    if not estado["conectado"]:
+    if not estado["conectado"] or transport is None:
         dist_text.set("— cm"); lbl_dist.config(fg="#cbd5e1")
-        obj_text.set("Libre"); lbl_objeto.config(fg="#94d82d")  # verde suave
+        obj_text.set("Libre"); lbl_objeto.config(fg="#94d82d")
         objeto_presente = False
-        ultra_job = root.after(ULTRA_POLL_MS, _poll_ultrasonico)
-        return
-
-    ip = ent_ip.get().strip()
+        ultra_job = root.after(ULTRA_POLL_MS, _poll_ultrasonico); return
     try:
-        r = requests.get(f"http://{ip}/distancia", timeout=TIMEOUT, headers={"Connection":"close"})
-        d = None
-        try:
-            j = r.json(); d = j.get("cm", None)
-        except ValueError:
-            txt = r.text.strip()
-            if txt and txt.lower() != "null":
-                d = float(txt)
-
-        if isinstance(d, (int, float)):
-            dist_text.set(f"{d:.0f} cm")
-            # Estado visual de distancia
-            lbl_dist.config(fg="#38bdf8")  # celeste por defecto
-            # Lógica de alerta (SIN frenar)
+        d = transport.read_distance()
+        if isinstance(d, (int,float)):
+            dist_text.set(f"{d:.0f} cm"); lbl_dist.config(fg="#38bdf8")
             activo = bool(alerta_var.get())
             detecta = (d <= umbral_var.get()) if activo else False
             if detecta != objeto_presente and detecta and beep_var.get():
-                root.bell()  # beep solo al entrar a OBJETO
+                root.bell()
             objeto_presente = detecta
             if detecta:
-                obj_text.set("OBJETO"); lbl_objeto.config(fg="#f43f5e")  # rojo
+                obj_text.set("OBJETO"); lbl_objeto.config(fg="#f43f5e")
             else:
-                obj_text.set("Libre");  lbl_objeto.config(fg="#22c55e")  # verde
+                obj_text.set("Libre");  lbl_objeto.config(fg="#22c55e")
         else:
             dist_text.set("— cm"); lbl_dist.config(fg="#cbd5e1")
             obj_text.set("Libre");  lbl_objeto.config(fg="#94d82d")
             objeto_presente = False
-    except requests.exceptions.RequestException:
+    except Exception:
         dist_text.set("— cm"); lbl_dist.config(fg="#cbd5e1")
         obj_text.set("Libre");  lbl_objeto.config(fg="#94d82d")
         objeto_presente = False
-
     ultra_job = root.after(ULTRA_POLL_MS, _poll_ultrasonico)
 
 def _start_ultra_poll():
     global ultra_job
     if ultra_job is None:
-        ultra_job = root.after(100, _poll_ultrasonico)
+        ultra_job = root.after(150, _poll_ultrasonico)
 
 def _stop_ultra_poll():
     global ultra_job
     if ultra_job is not None:
-        root.after_cancel(ultra_job)
-        ultra_job = None
+        root.after_cancel(ultra_job); ultra_job = None
     dist_text.set("— cm"); lbl_dist.config(fg="#cbd5e1")
     obj_text.set("Libre");  lbl_objeto.config(fg="#94d82d")
 
 # ------------------ Lógica de simulación y entrada ------------------
-teclas = set()
-MOV_KEYS = ("Up","Down","Left","Right")
-
+teclas = set(); MOV_KEYS = ("Up","Down","Left","Right")
 u, v = 0.5, 0.5
-lin_speed = 0.0
-ang_speed = 0.0
+lin_speed = 0.0; ang_speed = 0.0
 V_FWD, V_BACK, W_LEFT, W_RIGHT = 0.35, -0.35, +90.0, -90.0
 
 def get_cmd_for_key(k):
-    modo = modo_var.get()
-    inv = invertir_lr_var.get()
+    modo = modo_var.get(); inv = invertir_lr_var.get()
     if modo == MODO_LR_FA:
         if k == "Left":   return "atras"    if inv else "adelante"
         if k == "Right":  return "adelante" if inv else "atras"
@@ -519,11 +554,21 @@ def update_speeds():
     if modo == MODO_LR_FA:
         lin_speed = (V_FWD if "Left" in teclas else 0.0) + (V_BACK if "Right" in teclas else 0.0)
         ang_speed = (W_LEFT if "Up" in teclas else 0.0) + (W_RIGHT if "Down" in teclas else 0.0)
-        if invertir_lr_var.get():
-            lin_speed = -lin_speed
+        if invertir_lr_var.get(): lin_speed = -lin_speed
     else:
         lin_speed = (V_FWD if "Up" in teclas else 0.0) + (V_BACK if "Down" in teclas else 0.0)
         ang_speed = (W_LEFT if "Left" in teclas else 0.0) + (W_RIGHT if "Right" in teclas else 0.0)
+
+# Se construye con la función de envío de 'transport'
+sender = CommandSender(
+    sender_callable=lambda cmd: (transport and transport.send(cmd)) or False,
+    on_soft_error=soft_warn,
+    on_hard_disconnect=lambda m: on_desconectado(f"{m} (revisa conexión).")
+)
+
+def enviar_comando(cmd):
+    if estado["conectado"] and transport:
+        sender.queue(cmd)
 
 def stop_all(send_hw=True):
     teclas.clear()
@@ -570,7 +615,30 @@ btn_left.bind("<ButtonRelease-1>", lambda _e: _btn_release("Left"))
 btn_right.bind("<ButtonPress-1>",   lambda _e: _btn_press("Right"))
 btn_right.bind("<ButtonRelease-1>", lambda _e: _btn_release("Right"))
 
-# Bucle del simulador
+# -------- Conectar --------
+def do_connect():
+    global transport
+    modo = modo_conn.get()
+    estado["modo"] = modo
+    btn_conectar.config(state="disabled")
+    try:
+        if modo == "Wi-Fi":
+            transport = HttpTransport(lambda: ent_ip.get())
+        else:
+            transport = BtTransport(lambda: ent_com.get())
+        ok = transport.connect()
+        if ok:
+            on_conectado_ok()
+        else:
+            on_desconectado("No responde.")
+    except Exception as e:
+        on_desconectado(str(e))
+    finally:
+        btn_conectar.config(state="normal")
+
+btn_conectar.config(command=do_connect)
+
+# -------- Bucle del simulador --------
 _last = time.time()
 def step():
     global u, v, car_ang, car_img_ph, car_w, car_h, _last
@@ -587,9 +655,11 @@ def step():
         cnv.itemconfig(car_id, image=car_img_ph)
     TL, TR, BL, BR = plane["TL"], plane["TR"], plane["BL"], plane["BR"]
     px, py = bilinear(TL, TR, BL, BR, u, v)
-    cnv.coords(halo_id, px, py)
-    cnv.coords(car_id, px, py)
+    cnv.coords(halo_id, px, py); cnv.coords(car_id, px, py)
     root.after(16, step)
 
+# Crear canvas items después de sprite
+car_img_ph, car_w, car_h = sprite_from_angle(base_car_img, 0)
+car_id = cnv.create_image(PLANE_CX, PLANE_CY, image=car_img_ph)
 root.after(16, step)
 root.mainloop()
