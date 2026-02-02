@@ -1,0 +1,58 @@
+Instalar dependencias (una sola vez)
+sudo apt update
+sudo apt install -y python3 python3-flask python3-werkzeug python3-serial
+
+Verificar:
+python3 -c "import flask, werkzeug, serial; print('OK')"
+
+1 Crear carpeta y estructura del proyecto
+mkdir -p ~/web_pwm_arduino/templates
+mkdir -p ~/web_pwm_arduino/static/css
+cd ~/web_pwm_arduino
+
+2 Crear app.py (Flask + login + envío serial 9600)
+nano app.py
+
+3 Crear templates/login.html
+nano templates/login.html
+
+4 Crear templates/index.html
+nano templates/index.html
+
+5 Crear static/css/style.css
+nano static/css/style.css
+
+6 Generar contraseña (hash) y pegarla en app.py
+cd ~/web_pwm_arduino
+python3 -c "from werkzeug.security import generate_password_hash; print(generate_password_hash('12345'))"
+Copia el scrypt:... completo.
+Pégalo en app.py:
+nano app.py
+Cambia:   APP_PW_HASH = "PEGA_AQUI_TU_HASH_COMPLETO"
+Por       APP_PW_HASH = "scrypt:...."
+Verificar:
+grep -n "APP_PW_HASH" app.py
+
+7 Ejecutar el servidor (manual)
+cd ~/web_pwm_arduino
+python3 app.py
+
+Te mostrará la IP local (por ejemplo http://192.168.0.101:5000).
+
+8 Entrar desde tu PC/cel
+
+En el navegador:
+
+http://192.168.0.101:5000
+
+Login:
+
+Usuario: diana
+
+Contraseña: 12345 (o la que elegiste)
+
+
+Con esto ya tienes el proyecto completo “desde cero” exactamente con el mismo BAUD y el mismo formato de envío que tu server_pwm.py.
+
+
+

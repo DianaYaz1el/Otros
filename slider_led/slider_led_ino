@@ -1,0 +1,26 @@
+// Pin PWM donde está el LED (por ejemplo en un Arduino UNO)
+const int LED_PIN = 9;
+
+void setup() {
+  pinMode(LED_PIN, OUTPUT);
+  Serial.begin(9600);  // debe ser el mismo BAUDRATE que en server_pwm.py
+}
+
+void loop() {
+  // Si hay datos disponibles en el puerto serie
+  if (Serial.available() > 0) {
+    int valor = Serial.parseInt();  // leer número entero enviado (0–255)
+
+    if (valor >= 0 && valor <= 255) {
+      analogWrite(LED_PIN, valor);  // ajustar brillo del LED
+      // (opcional) mandar eco por serial para debug:
+      // Serial.print("Brillo: ");
+      // Serial.println(valor);
+    }
+
+    // Limpiar caracteres sobrantes (por ejemplo '\n')
+    while (Serial.available() > 0) {
+      Serial.read();
+    }
+  }
+}

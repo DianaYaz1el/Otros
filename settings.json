@@ -1,0 +1,12 @@
+{
+    "terminal.integrated.defaultProfile.windows": "Python 3.11",
+    "terminal.integrated.profiles.windows": {
+        "Python 3.11": {
+            "path": "C:/Windows/System32/cmd.exe",
+            "args": [
+                "/k",
+                "py -3.11"
+            ]
+        }
+    }
+}

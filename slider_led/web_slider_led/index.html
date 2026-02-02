@@ -1,0 +1,57 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>PWM Control</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
+</head>
+
+<body class="bg">
+
+  <h1 class="main-title">Control de Brillo de un LED</h1>
+
+  <div class="card">
+    <div class="row">
+      <div>
+        <h1>PWM (0–255)</h1>
+        <p class="sub">Envía el valor al Arduino por Serial</p>
+      </div>
+
+      <a class="btn btn-secondary" href="{{ url_for('logout') }}">Salir</a>
+    </div>
+
+    <div class="pwm-box">
+      <input id="slider" type="range" min="0" max="255" value="0">
+      <div class="value">Valor: <span id="val">0</span></div>
+      <div id="status" class="hint"></div>
+    </div>
+  </div>
+
+<script>
+const slider = document.getElementById("slider");
+const val = document.getElementById("val");
+const statusEl = document.getElementById("status");
+let t = null;
+
+function sendPWM(v){
+  fetch("/set_pwm", {
+    method: "POST",
+    headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({value: v})
+  })
+  .then(r => r.json())
+  .then(j => statusEl.textContent = j.ok ? ("Enviado al Arduino: " + j.value) : ("Error: " + (j.error || "desconocido")))
+  .catch(err => statusEl.textContent = "Error de red: " + err);
+}
+
+slider.addEventListener("input", () => {
+  const v = slider.value;
+  val.textContent = v;
+  if(t) clearTimeout(t);
+  t = setTimeout(() => sendPWM(v), 120);
+});
+</script>
+
+</body>
+</html>
